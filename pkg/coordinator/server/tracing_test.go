@@ -31,6 +31,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	otelsemconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
@@ -274,5 +275,57 @@ func TestOTelHandlerPreservesStreamingInterfaces(t *testing.T) {
 	}
 	if !canFlush {
 		t.Error("otel wrapper hides http.Flusher, streamed chunks would not reach the client")
+	}
+}
+
+// With span export off the provider is a no-op, and the incoming trace context
+// still reaches the gateway unchanged on both the pipeline and passthrough
+// paths, so client and EPP spans stay in one trace.
+func TestPropagationWithExportOff(t *testing.T) {
+	prevProvider, prevPropagator := otel.GetTracerProvider(), otel.GetTextMapPropagator()
+	otel.SetTracerProvider(noop.NewTracerProvider())
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevProvider)
+		otel.SetTextMapPropagator(prevPropagator)
+	})
+
+	incoming := "00-" + upstreamTraceID + "-" + upstreamSpanID + "-01"
+	var got []string
+	gwStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("traceparent"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer gwStub.Close()
+
+	gw := gateway.NewWithTransport(&http.Transport{}, gwStub.URL)
+	callGateway := stubStep{name: "call-gateway", fn: func(ctx context.Context, _ *pipeline.RequestContext) error {
+		resp, err := gw.Post(ctx, "/v1/chat/completions", []byte(`{}`), nil)
+		if err != nil {
+			return err
+		}
+		return resp.Body.Close()
+	}}
+	srv, err := New(config.ServerConfig{}, pipeline.New([]pipeline.Step{callGateway}), gw)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, req := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`)),
+		httptest.NewRequest(http.MethodGet, "/v1/models", nil),
+	} {
+		req.Header.Set("traceparent", incoming)
+		srv.httpServer.Handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("gateway received %d requests, want 2", len(got))
+	}
+	for i, traceparent := range got {
+		if traceparent != incoming {
+			t.Errorf("gateway request %d traceparent = %q, want %q", i, traceparent, incoming)
+		}
 	}
 }
